@@ -1,0 +1,42 @@
+numba
+pillow
+spectral
+numpy
+jupyter
+tifffile
+matplotlib
+scipy
+scikit-image
+torch
+pyvis
+jinja2
+rdflib
+pyvis
+networkx
+tiatoolbox
+openslide-bin
+
+deepproblog
+problog
+PySDD
+pyswip
+#swi-prolog
+
+# Core
+deepproblog==2.0.6
+problog==2.2.9
+PySDD==1.0.6
+
+# DeepProbLog relies on PyTorch + TorchVision (installation may differ for CPU vs CUDA)
+torch
+torchvision
+
+# Optional: only if you plan to use Approximate Inference (not needed for ExactEngine)
+# pyswip @ git+https://github.com/ML-KULeuven/pyswip
+# Note: also requires SWI-Prolog < 9.0.0 installed system-wide.
+
+openai
+pathologyfoundation
+
+open_clip_torch==2.23.0
+transformers==4.35.2
