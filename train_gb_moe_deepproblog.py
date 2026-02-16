@@ -634,7 +634,19 @@ def train_direct(
     Directly maximize query likelihood via DeepProbLog's own training.
     We implement the loop explicitly so you can add regularizers easily.
     """
-    opt = torch.optim.Adam(model.get_torch_parameters(), lr=lr)
+
+    # Collect PyTorch parameters from all DeepProbLog networks
+    torch_params = []
+    seen = set()
+
+    for net in model.networks.values():          # dict: name -> deepproblog.network.Network :contentReference[oaicite:0]{index=0}
+        for p in net.parameters():              # delegates to underlying torch.nn.Module.parameters() :contentReference[oaicite:1]{index=1}
+            if p.requires_grad and id(p) not in seen:
+                torch_params.append(p)
+                seen.add(id(p))
+
+    opt = torch.optim.Adam(torch_params, lr=lr)
+
 
     model.train()
 
@@ -656,9 +668,38 @@ def train_direct(
             # --- DeepProbLog probability of each query ---
             # API NOTE: depending on version, this could be model.solve(queries) or model.solve_query(q).
             # We support both patterns.
-            probs = model.solve(queries)  # expected: list[float] or torch tensor (N,)
-            if not torch.is_tensor(probs):
-                probs = torch.tensor(probs, device=device, dtype=torch.float32)
+            # --- DeepProbLog probability of each query ---
+            # model.solve(batch) returns List[Result], not floats
+            results = model.solve(queries)
+
+            probs_list = []
+            for q, r in zip(queries, results):
+                res_dict = r.result  # Dict[Term, Union[float, torch.Tensor]]
+
+                # Usually the key is exactly q.query. If not, fall back to the single entry.
+                if q.query in res_dict:
+                    v = res_dict[q.query]
+                elif len(res_dict) == 1:
+                    v = next(iter(res_dict.values()))
+                else:
+                    preview = ", ".join(str(k) for k in list(res_dict.keys())[:5])
+                    raise KeyError(
+                        f"Could not find query term {q.query} in Result keys. "
+                        f"First keys: {preview}"
+                    )
+
+                if torch.is_tensor(v):
+                    v = v.to(device=device, dtype=torch.float32)
+                    if v.numel() != 1:
+                        raise ValueError(f"Expected scalar probability, got shape {tuple(v.shape)} for query {q}")
+                    v = v.reshape(())  # ensure scalar tensor
+                else:
+                    v = torch.tensor(float(v), device=device, dtype=torch.float32)
+
+                probs_list.append(v)
+
+            probs = torch.stack(probs_list, dim=0)  # shape (N,)
+
 
             # Negative log likelihood: -log P(query=true)
             eps = 1e-8
@@ -686,42 +727,57 @@ def em_e_step(
     expert_pred_names: List[str],
     device: torch.device,
     max_items: Optional[int] = None,
+    *,
+    chunk_size: int = 5120,
 ) -> Dict[str, torch.Tensor]:
     """
     Computes soft pseudo-targets q_e(i) = P(expert_present | label(i))
     via q = P(joint)/P(label).
 
+    Key change vs. the original:
+    - batches queries and calls model.solve(...) in chunks instead of per-example.
+      This is usually the dominant speedup because Model.solve expects a batch and
+      internally groups NN calls per net for batched evaluation. :contentReference[oaicite:1]{index=1}
+
     Returns:
-      soft_targets[expert] = (N,) float tensor on CPU
+      soft_targets[expert_net_name] = (N,) float tensor on CPU
     """
     N = len(dataset) if max_items is None else min(len(dataset), max_items)
+    idxs = list(range(N))
 
-    # Precompute label query probabilities
-    label_probs = torch.zeros(N, dtype=torch.float32)
-    for i in range(N):
-        is_gb = bool(dataset.labels[i] == 1)
-        q = q_label(i, is_gb)
-        res = model.solve([q])[0]
-        label_probs[i] = float(res.result[q.query])
+    # ---- Label probabilities: P(gb(I)) or P(normal(I)) ----
+    label_queries: List[Query] = [
+        q_label(i, is_gb=bool(dataset.labels[i] == 1)) for i in idxs
+    ]
+    label_probs_np = solve_probs_chunked(model, label_queries, chunk_size=chunk_size)
+    label_probs = torch.from_numpy(label_probs_np).to(dtype=torch.float32)  # CPU (N,)
     print(f"{label_probs = }")
 
-    # TODO: Is there a way to distribute this work across a multi-GPU setup?
+    # NOTE on multi-GPU:
+    # DeepProbLog's solver runs in a single Python process; it does not natively
+    # parallelize inference across multiple GPUs. If you truly need multi-GPU, the
+    # standard approach is to shard idxs across *processes*, each process constructs
+    # its own Model(+Engine) pinned to one GPU, runs solve() on its shard, then you
+    # concatenate results. The batching below is usually the biggest win first.
+
     soft_targets: Dict[str, torch.Tensor] = {}
-    for e, pe in zip(expert_net_names, expert_pred_names):
-        print(f"Computing soft targets for {e} expert")
-        joint_probs = torch.zeros(N, dtype=torch.float32)
-        for i in range(N):
-            is_gb = bool(dataset.labels[i] == 1)
-            qj = q_joint(i, pe, is_gb)
-            res = model.solve([qj])[0]
-            joint_probs[i] = float(res.result[qj.query])
+
+    # ---- For each expert: joint probabilities P(label(I) ∧ expert_present(I)) ----
+    for net_name, pred_name in zip(expert_net_names, expert_pred_names):
+        print(f"computing soft targets for {net_name}...")
+        joint_queries: List[Query] = [
+            q_joint(i, expert_name=pred_name, is_gb=bool(dataset.labels[i] == 1))
+            for i in idxs
+        ]
+        joint_probs_np = solve_probs_chunked(model, joint_queries, chunk_size=chunk_size)
+        joint_probs = torch.from_numpy(joint_probs_np).to(dtype=torch.float32)  # CPU (N,)
 
         q = joint_probs / label_probs.clamp_min(1e-8)
-        soft_targets[e] = q.clamp(0.0, 1.0)
+        soft_targets[net_name] = q.clamp(0.0, 1.0)
 
-    print("Displaying soft targets...")
-    for expert, t in soft_targets.items():
-        print(expert)
+    print("Displaying soft targets...") 
+    for expert, t in soft_targets.items(): 
+        print(expert) 
         print(t)
     return soft_targets
 
@@ -918,7 +974,7 @@ def main():
     ap.add_argument("--work_pl", type=str, default="moe_glioma_histology_train.pl", help="Augmented .pl output path")
 
     ap.add_argument("--train_mode", type=str, choices=["direct", "em"], required=True)
-    ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--device", type=str, default="cuda:0")
 
     ap.add_argument("--seed", type=int, default=42)
 
@@ -962,10 +1018,9 @@ def main():
     args = ap.parse_args()
     set_seed(args.seed)
 
-    device = torch.device(args.device if (torch.cuda.is_available() and args.device == "cuda") else "cpu")
+    device = torch.device(args.device if (torch.cuda.is_available() and "cuda" in args.device) else "cpu")
 
 
-    # TODO: load your real images here (3,H,W) already normalized for BiomedCLIP
     # Placeholder: random tensors (REPLACE THIS)
     # Load slides from CSV (expects columns: path,label)
     import csv
